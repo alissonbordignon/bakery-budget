@@ -450,11 +450,80 @@ def action_save_quote(conn, body):
     return {"ok": True, "quote": quote}
 
 
+def action_update_quote(conn, body):
+    quote = body.get("quote") or {}
+    quote_id = quote.get("id")
+    customer_name = str(quote.get("customerName") or "").strip()
+    items = quote.get("items") or []
+    if not quote_id:
+        raise ApiError("Orçamento inválido.", 400)
+    if not customer_name or not items:
+        raise ApiError("Informe o cliente e adicione pelo menos um item.", 400)
+
+    existing = conn.execute("SELECT id FROM quotes WHERE id = ?", (quote_id,)).fetchone()
+    if not existing:
+        raise ApiError("Orçamento não encontrado.", 404)
+
+    conn.execute(
+        """
+        UPDATE quotes SET customer_name = ?, customer_phone = ?, event_date = ?, valid_until = ?,
+          notes = ?, subtotal_cents = ?, deposit_percent = ? WHERE id = ?
+        """,
+        (
+            customer_name,
+            quote.get("customerPhone") or "",
+            quote.get("eventDate") or None,
+            quote.get("validUntil") or "",
+            quote.get("notes") or "",
+            round(float(quote.get("subtotalCents") or 0)),
+            float(quote.get("depositPercent") or 0),
+            quote_id,
+        ),
+    )
+    # Substitui os itens por completo: mais simples e seguro do que tentar
+    # calcular um diff entre a lista antiga e a nova.
+    conn.execute("DELETE FROM quote_items WHERE quote_id = ?", (quote_id,))
+    for item in items:
+        conn.execute(
+            """
+            INSERT INTO quote_items
+              (id, quote_id, product_id, product_name, unit, quantity, unit_price_cents, total_cents)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.get("id") or new_id(),
+                quote_id,
+                item.get("productId"),
+                item.get("productName") or "",
+                item.get("unit") or "",
+                float(item.get("quantity") or 0),
+                round(float(item.get("unitPriceCents") or 0)),
+                round(float(item.get("totalCents") or 0)),
+            ),
+        )
+    conn.commit()
+    return {"ok": True, "quote": quote}
+
+
+def action_delete_quote(conn, body):
+    quote_id = body.get("id")
+    if not quote_id:
+        raise ApiError("Orçamento inválido.", 400)
+    # ON DELETE CASCADE (com foreign_keys=ON) já remove os itens junto.
+    cursor = conn.execute("DELETE FROM quotes WHERE id = ?", (str(quote_id),))
+    conn.commit()
+    if cursor.rowcount == 0:
+        raise ApiError("Orçamento não encontrado.", 404)
+    return {"ok": True}
+
+
 ACTIONS = {
     "saveSettings": action_save_settings,
     "saveProduct": action_save_product,
     "toggleProduct": action_toggle_product,
     "saveQuote": action_save_quote,
+    "updateQuote": action_update_quote,
+    "deleteQuote": action_delete_quote,
 }
 
 
@@ -713,7 +782,10 @@ dialog::backdrop{background:rgba(40,25,18,.45);}
               <p class="section-kicker">Etapa 1</p>
               <h2 class="section-title">Dados do cliente</h2>
             </div>
-            <span id="current-number-badge" class="badge badge-accent"></span>
+            <div style="display:flex; align-items:center; gap:.5rem;">
+              <span id="editing-badge" class="badge hidden" style="background:#b45309; color:#fff;">✎ Editando orçamento existente</span>
+              <span id="current-number-badge" class="badge badge-accent"></span>
+            </div>
           </div>
           <div class="grid grid-2">
             <div class="field">
@@ -882,11 +954,13 @@ APP_JS = r'''
     items: [],
     selectedProduct: null,
     editingProductId: null,
+    editingQuoteId: null,
     currentNumber: "",
     saved: false,
     saving: false,
     savingSettings: false,
     savingProduct: false,
+    deletingQuoteId: null,
   };
 
   var money = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
@@ -1125,9 +1199,12 @@ APP_JS = r'''
   function updateSaveButtonState(){
     var btn = $("btn-save");
     btn.disabled = state.saving || state.saved;
-    if(state.saving){ btn.textContent = "Salvando..."; }
-    else if(state.saved){ btn.textContent = "✓ Orçamento salvo"; }
-    else { btn.textContent = "💾 Salvar orçamento"; }
+    var editing = !!state.editingQuoteId;
+    if(state.saving){ btn.textContent = editing ? "Atualizando..." : "Salvando..."; }
+    else if(state.saved){ btn.textContent = editing ? "✓ Orçamento atualizado" : "✓ Orçamento salvo"; }
+    else { btn.textContent = editing ? "💾 Atualizar orçamento" : "💾 Salvar orçamento"; }
+    var badge = $("editing-badge");
+    if(badge) badge.classList.toggle("hidden", !editing);
   }
 
   function buildItemsTableHTML(){
@@ -1240,6 +1317,7 @@ APP_JS = r'''
     $("input-notes").value = "";
     state.items = [];
     state.saved = false;
+    state.editingQuoteId = null;
     state.currentNumber = quoteNumber(state.quotes.length);
     renderQuoteRight();
   }
@@ -1249,6 +1327,9 @@ APP_JS = r'''
     if(!customerName){ toast("Informe o nome do cliente.", "error"); return; }
     if(!state.items.length){ toast("Adicione pelo menos um item.", "error"); return; }
 
+    var isEditing = !!state.editingQuoteId;
+    var original = isEditing ? state.quotes.find(function(q){ return q.id === state.editingQuoteId; }) : null;
+
     state.saving = true;
     updateSaveButtonState();
     try {
@@ -1256,7 +1337,7 @@ APP_JS = r'''
       var depositPercent = Number(state.settings.deposit_percent || 50);
       var validityDays = Number(state.settings.validity_days || 5);
       var quote = {
-        id: makeId(),
+        id: isEditing ? state.editingQuoteId : makeId(),
         quoteNumber: state.currentNumber,
         customerName: customerName,
         customerPhone: $("input-customer-phone").value,
@@ -1265,14 +1346,21 @@ APP_JS = r'''
         notes: $("input-notes").value,
         subtotalCents: subtotalCents,
         depositPercent: depositPercent,
-        createdAt: new Date().toISOString(),
+        createdAt: (original && original.createdAt) || new Date().toISOString(),
         items: state.items,
       };
-      await postAction({ action: "saveQuote", quote: quote });
-      state.quotes.unshift(quote);
+      if(isEditing){
+        await postAction({ action: "updateQuote", quote: quote });
+        var idx = state.quotes.findIndex(function(q){ return q.id === quote.id; });
+        if(idx !== -1) state.quotes[idx] = quote;
+        toast("Orçamento atualizado.", "success");
+      } else {
+        await postAction({ action: "saveQuote", quote: quote });
+        state.quotes.unshift(quote);
+        toast("Orçamento salvo. Agora você pode imprimir ou enviar.", "success");
+      }
       state.saved = true;
       renderHistoryTab();
-      toast("Orçamento salvo. Agora você pode imprimir ou enviar.", "success");
     } catch(e){
       toast((e && e.message) || "Não foi possível salvar.", "error");
     } finally {
@@ -1334,33 +1422,84 @@ APP_JS = r'''
       return;
     }
     var rows = state.quotes.map(function(q){
+      var busy = state.deletingQuoteId === q.id;
       return '<tr>' +
         '<td class="mono">' + escapeHTML(q.quoteNumber) + '</td>' +
         '<td><div class="cell-strong">' + escapeHTML(q.customerName) + '</div><div class="cell-sub">' + escapeHTML(q.customerPhone || "Sem telefone") + '</div></td>' +
         '<td>' + (q.eventDate ? escapeHTML(formatDateBR(q.eventDate)) : "-") + '</td>' +
         '<td>' + escapeHTML(formatDateBR(q.validUntil)) + '</td>' +
         '<td class="ta-right cell-strong">' + escapeHTML(money.format(q.subtotalCents / 100)) + '</td>' +
-        '<td class="ta-right"><button class="btn btn-outline btn-sm" onclick="app.duplicateQuote(\'' + q.id + '\')">📄 Duplicar</button></td>' +
+        '<td class="ta-right">' +
+          '<div style="display:inline-flex; gap:.35rem; flex-wrap:wrap; justify-content:flex-end;">' +
+            '<button class="btn btn-outline btn-sm" onclick="app.editQuote(\'' + q.id + '\')">✎ Editar</button>' +
+            '<button class="btn btn-outline btn-sm" onclick="app.duplicateQuote(\'' + q.id + '\')">📄 Duplicar</button>' +
+            '<button class="btn btn-outline btn-sm" style="color:#a33a32; border-color:#e3b3ad;" ' +
+              'onclick="app.deleteQuote(\'' + q.id + '\')" ' + (busy ? "disabled" : "") + '>' +
+              (busy ? "Excluindo..." : "🗑 Excluir") +
+            '</button>' +
+          '</div>' +
+        '</td>' +
       '</tr>';
     }).join("");
     wrap.innerHTML = '<div class="table-wrap"><table><thead><tr>' +
-      '<th>Número</th><th>Cliente</th><th>Evento</th><th>Validade</th><th class="ta-right">Total</th><th class="ta-right">Ação</th>' +
+      '<th>Número</th><th>Cliente</th><th>Evento</th><th>Validade</th><th class="ta-right">Total</th><th class="ta-right">Ações</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function loadQuoteIntoForm(quote){
+    $("input-customer-name").value = quote.customerName;
+    $("input-customer-phone").value = quote.customerPhone;
+    $("input-event-date").value = quote.eventDate || "";
+    $("input-notes").value = quote.notes || "";
+    state.items = quote.items.map(function(item){ return Object.assign({}, item); });
+  }
+
+  function editQuote(id){
+    var quote = state.quotes.find(function(q){ return q.id === id; });
+    if(!quote) return;
+    loadQuoteIntoForm(quote);
+    state.editingQuoteId = quote.id;
+    state.currentNumber = quote.quoteNumber;
+    state.saved = true;
+    switchTab("quote");
+    renderQuoteRight();
+    toast("Editando o orçamento " + quote.quoteNumber + ". Altere o que precisar e clique em Atualizar.", "success");
   }
 
   function duplicateQuote(id){
     var quote = state.quotes.find(function(q){ return q.id === id; });
     if(!quote) return;
-    $("input-customer-name").value = quote.customerName;
-    $("input-customer-phone").value = quote.customerPhone;
-    $("input-event-date").value = quote.eventDate || "";
-    $("input-notes").value = quote.notes || "";
-    state.items = quote.items.map(function(item){ return Object.assign({}, item, { id: makeId() }); });
+    loadQuoteIntoForm(quote);
+    state.items = state.items.map(function(item){ return Object.assign({}, item, { id: makeId() }); });
+    state.editingQuoteId = null;
     state.currentNumber = quoteNumber(state.quotes.length);
     state.saved = false;
     switchTab("quote");
     renderQuoteRight();
     toast("Orçamento duplicado. Revise os dados e salve como novo.", "success");
+  }
+
+  async function deleteQuote(id){
+    var quote = state.quotes.find(function(q){ return q.id === id; });
+    if(!quote) return;
+    var ok = window.confirm("Excluir o orçamento " + quote.quoteNumber + " de " + quote.customerName + "? Esta ação não pode ser desfeita.");
+    if(!ok) return;
+
+    state.deletingQuoteId = id;
+    renderHistoryTab();
+    try {
+      await postAction({ action: "deleteQuote", id: id });
+      state.quotes = state.quotes.filter(function(q){ return q.id !== id; });
+      if(state.editingQuoteId === id){
+        resetQuote();
+      }
+      toast("Orçamento excluído.", "success");
+    } catch(e){
+      toast((e && e.message) || "Não foi possível excluir o orçamento.", "error");
+    } finally {
+      state.deletingQuoteId = null;
+      renderHistoryTab();
+    }
   }
 
   // ------------------------------------------------------------------
@@ -1515,6 +1654,8 @@ APP_JS = r'''
     copyMessage: copyMessage,
     openWhatsApp: openWhatsApp,
     duplicateQuote: duplicateQuote,
+    editQuote: editQuote,
+    deleteQuote: deleteQuote,
     openProductDialog: openProductDialog,
     saveProductDialog: saveProductDialog,
     toggleProduct: toggleProduct,
