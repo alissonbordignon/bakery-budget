@@ -1353,13 +1353,16 @@ APP_JS = r'''
         await postAction({ action: "updateQuote", quote: quote });
         var idx = state.quotes.findIndex(function(q){ return q.id === quote.id; });
         if(idx !== -1) state.quotes[idx] = quote;
+        state.saved = true;
         toast("Orçamento atualizado.", "success");
       } else {
         await postAction({ action: "saveQuote", quote: quote });
         state.quotes.unshift(quote);
-        toast("Orçamento salvo. Agora você pode imprimir ou enviar.", "success");
+        toast(quote.quoteNumber + " salvo. Pronto para um novo orçamento — para reimprimir ou reenviar, use Editar no Histórico.", "success");
+        // Depois de salvar um orçamento novo (não uma edição), a tela volta
+        // zerada e com o próximo número já pronto para o próximo cliente.
+        resetQuote();
       }
-      state.saved = true;
       renderHistoryTab();
     } catch(e){
       toast((e && e.message) || "Não foi possível salvar.", "error");
